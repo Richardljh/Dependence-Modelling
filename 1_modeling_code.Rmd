@@ -54,6 +54,38 @@ Poisson.Deviance(dat1$HomoNb[dat1$ind==ind_test], dat1$ClaimNb[dat1$ind==ind_tes
 
 Poisson Regression is better based on Poisson Deviance Loss on test_feq and minus ZTP loglikelihood on test_sev. Due to the predictive performance of Poisson regression, we think three part model proposed by Shi (2015) is not appropriate for these data.
 
+```{r}
+nb_reg <- glm.nb(ClaimNb ~ LnVehValue + VehAge + VehBody + Gender + DrivAge +  offset(log(Exposure)) , data = dat1[dat1$ind!=ind_test,], link= log)
+nb_reg<-step(nb_reg,trace = 0)
+options(digits=5)
+summary(nb_reg,digits=5)
+
+dat1$NBNb<-predict(nb_reg,newdata = dat1, type = "response")
+dat2$NBNb<-predict(nb_reg, newdata = dat2, type = "response")
+```
+
+
+
+
+
+```{r}
+mx_reg <- gamlssMX(ClaimNb ~ LnVehValue  + DrivAge +  offset(log(Exposure)) , data = dat1[dat1$ind!=ind_test,],family = 'PO', K=2, control = MX.control(seed = 1010))
+mx_reg
+```
+
+```{r}
+mx_reg_1 <- mx_reg$models[[1]]
+mx_reg_2 <- mx_reg$models[[2]]
+dat1$MXNb_1 <- exp(model.matrix(ClaimNb ~ LnVehValue  + DrivAge +  log(Exposure), data = dat1)%*%c(mx_reg_1$mu.coefficients,1))
+dat1$MXNb_2 <- exp(model.matrix(ClaimNb ~ LnVehValue  + DrivAge +  log(Exposure), data = dat1)%*%c(mx_reg_2$mu.coefficients,1))
+dat1$MXNb <- mx_reg$prob[1]*dat1$MXNb_1 + mx_reg$prob[2]*dat1$MXNb_2
+dat2$MXNb_1 <- exp(model.matrix(ClaimNb ~ LnVehValue  + DrivAge +  log(Exposure), data = dat2)%*%c(mx_reg_1$mu.coefficients,1))
+dat2$MXNb_2 <- exp(model.matrix(ClaimNb ~ LnVehValue  + DrivAge +  log(Exposure), data = dat2)%*%c(mx_reg_2$mu.coefficients,1))
+dat2$MXNb <- mx_reg$prob[1]*dat2$MXNb_1 + mx_reg$prob[2]*dat2$MXNb_2
+```
+
+
+
 ##  Severity models
 
 ### Without claim counts
@@ -131,11 +163,19 @@ mean((dat2$LnSe_N[dat2$ind==ind_test]-dat2$LnSev[dat2$ind==ind_test])^2)
 # Joint modelling 
 
 ## Estimation of $\rho$ by IFM
+```{r}
+z1m<-function(lambda_1, lambda_2, pi_1, pi_2){
+  FT_1 <- (1-dpois(0,lambda_1)-dpois(1,lambda_1))/(1-dpois(0,lambda_1))
+  FT_2 <- (1-dpois(0,lambda_2)-dpois(1,lambda_2))/(1-dpois(0,lambda_2))
+  return(qnorm(pi_1*FT_1+pi_2*FT_2))
+}
+```
 
 ```{r}
 dat2$z_fre<-z1(dat2$PoiNb)
 dat2$z_sev<-z2(summary(ga_reg)$dispersion, dat2$GaSe, dat2$ClaimSev, dat2$ClaimNb)
-dat2$z_sev_ln<- z2_ln(summary(ln_reg)$dispersion, ln_mu=dat2$LnSe, ln_sev=dat2$LnSev )
+dat2$z_sev_ln<- z2_ln(summary(ln_reg)$dispersion, ln_mu=dat2$LnSe, ln_sev=dat2$LnSev)
+dat2$z_fre_m<-z1m(dat2$MXNb_1, dat2$MXNb_2, mx_reg$prob[1], mx_reg$prob[2])
 dat2_learn<-dat2[dat2$ind!=ind_test,]
 dat1_test<-dat1[dat1$ind==ind_test,]
 
@@ -157,6 +197,12 @@ library(pracma)
 fisher_infor<-fderiv(obj_fun_ln,rho_hat_ln, n=2, method = "central")
 (rho_hat_sd <- sqrt(1/fisher_infor))
 c(rho_hat_ln-qnorm(0.975)*rho_hat_sd,rho_hat_ln+qnorm(0.975)*rho_hat_sd)
+```
+```{r}
+obj_fun_ln_m<-function(rho){
+  rho_f(ind=ifelse(dat2_learn$ClaimNb==1,1,0), z1=dat2_learn$z_fre_m, z2=dat2_learn$z_sev_ln, rho)
+}
+(rho_hat_ln_m = optim(par=0, obj_fun_ln_m, method='Brent', lower=-1, upper=1)$par)
 ```
 
 ## Conditional expectation of logged severity given N
@@ -381,6 +427,7 @@ estimation of $\rho$ by IFM
 ```
 
 
+
 ```{r}
 set.seed(1010)
 kramer_S = matrix(nrow = nrow(dat1_test), ncol = TT)
@@ -425,6 +472,478 @@ ks.test(jitter(ind_percent_ln),"punif")
 ks.test(jitter(condi_percent_ln),"punif")
 ks.test(jitter(kramer_percent_ln),"punif")
 ks.test(jitter(our_percent_ln),"punif")
+```
+
+```{r}
+ifm_rho_kramer_nb <- function(ClaimNb, lambda, sigma, Sev, mu, 
+                           phi, ln){
+  
+  alpha = 1/phi # shape parameter of gamma distribution
+  beta = alpha/mu # rate parameter of gamma distribution
+  
+  # calculate u, v, w from Kramer(2013)
+  if (ln==F) {
+    u = pgamma(q = Sev, shape = ClaimNb*alpha, rate = ClaimNb*beta)
+  }
+  if (ln==T){
+    u = pnorm(q = Sev, mean = mu, sd = sqrt(phi) )
+  }
+  v = pNBItr(q = ClaimNb, mu=lambda, sigma = sigma)#pPOtr(q = ClaimNb, mu=lambda)
+  w = pNBItr(q = ClaimNb-1, mu=lambda, sigma = sigma)#pPOtr(q = ClaimNb - 1, mu=lambda)
+  
+  #minus joint log-likelihood
+  object_fun <- function(rho){
+    -sum(log(D1(u, v, rho)-D1(u, w, rho)))
+  }
+  
+  ifm_joint <- optim(par=0,
+                     fn = object_fun,
+                     lower=-1,
+                     upper=1,
+                     method = 'Brent')
+  # rho_hat = (exp(2*ifm_joint$par)-1)/(exp(2*ifm_joint$par)+1)
+  rho_hat = ifm_joint$par
+  return(rho_hat)
+}
+
+(kramer_rho_ln_nb <-ifm_rho_kramer_nb(
+  ClaimNb = dat2_learn$ClaimNb,
+  lambda = dat2_learn$NBNb,
+  sigma = 1/nb_reg$theta,
+  Sev = dat2_learn$LnSev,
+  mu = dat2_learn$LnSe, # mean of gamma distribution
+  phi = (summary(ln_reg))$dispersion, # dispersion parameter of gamma distribution
+  ln=T))
+```
+
+```{r}
+pred_kramer_S_nb <- function(lambda, sigma, mu, phi, rho, TT,ln){
+  S <- rep(0,TT)
+  alpha = 1/phi # shape parameter of gamma distribution
+  beta = 1/(phi*mu) # rate parameter of gamma distribution
+  for(i in 1:TT){
+    if (ln==F){
+      sev <- rgamma(1,shape = alpha, rate = beta)
+      u = pgamma(q = sev, shape = alpha, rate = beta)
+    }
+    if (ln==T){
+      sev <- exp(rnorm(1, mean = mu, sd = sqrt(phi)) )
+      u = pnorm(q = log(sev), mean = mu, sd = sqrt(phi) )
+    }
+    Pr_N<-rep(NA,4)
+    Pr_N[0+1] <- pNBI(0, mu = lambda, sigma = sigma)#ppois(0, lambda)
+    for (k in 1:2){
+      v = pNBItr(q=k, mu=lambda, sigma=sigma)#pPOtr(q = k, mu=lambda)
+      w = pNBItr(q=k-1, mu=lambda, sigma=sigma)#pPOtr(q = k-1, mu=lambda)
+      Pr_N[k+1] <- (D1(u,v,rho)-D1(u,w,rho))*(1-Pr_N[0+1])
+    }
+    Pr_N[4]<-1-sum(Pr_N[1:3])
+    R=which(as.vector(rmultinom(1,1,prob=Pr_N))==1)-1
+    S[i]=R*sev
+    if (is.na(S[i])==1) stop("NA generated") 
+    }
+ return(S)
+}
+
+pred_condition_S_nb <- function(lambda, sigma, mu, phi, coef_N, TT, dis){
+  S <- rep(0,TT)
+  for(i in 1:TT){
+    N <- rNBI(1, mu=lambda, sigma = sigma)#rpois(1, lambda)
+    if (N == 0){
+      S[i] = 0
+    } 
+    else{
+      if (dis=="gamma"){
+        mu1 = mu * exp(N*coef_N)
+        alpha = 1/phi # shape parameter of gamma distribution
+        beta = 1/(phi*mu1) # rate parameter of gamma distribution
+        S[i] <- N*rgamma(1, shape = N*alpha, rate = N*beta)
+      }
+      if (dis=="lnorm"){
+        mu1 = mu + N*coef_N
+        S[i] <- N*exp(rnorm(1, mean = mu1, sd = sqrt(phi)))
+      }
+      if (dis=="lgamma"){
+        mu1 = mu + N*coef_N
+        alpha = 1/phi
+        beta = 1/(phi*mu1)
+        S[i] <- N*exp(rgamma(1, shape = alpha, rate=beta))
+      }
+    }
+  }
+  return(S)
+}
+```
+
+```{r}
+independent_S_ln_nb = matrix(nrow = nrow(dat1_test), ncol = TT)
+for(i in 1:nrow(dat1_test)){
+  independent_S_ln_nb[i,] <- pred_condition_S_nb(lambda = dat1_test$NBNb[i], sigma = 1/nb_reg$theta, mu = dat1_test$LnSe[i], phi = (summary(ln_reg))$dispersion, coef_N = 0, TT = TT, dis="lnorm")
+    if (i%%1000==0){print(i)}
+}
+independenttotalloss_ln_nb <- apply(independent_S_ln_nb, 2, sum)
+da$ind_ln_nb <-apply(independent_S_ln,1,mean)
+
+condition_S_ln_nb = matrix(nrow = nrow(dat1_test), ncol = TT)
+for(i in 1:nrow(dat1_test)){
+  condition_S_ln_nb[i,] <- pred_condition_S_nb(lambda = dat1_test$NBNb[i], sigma = 1/nb_reg$theta, mu = dat1_test$LnSe_NN[i], phi = summary(ln_reg_n)$dispersion, coef_N=coef_N_ln, TT = TT, dis="lnorm")
+  if (i%%1000==0){print(i)}
+}
+conditiontotalloss_ln_nb <- apply(condition_S_ln_nb, 2, sum)
+da$cond_ln_nb <-apply(condition_S_ln_nb, 1,mean)
+
+kramer_S_ln_nb = matrix(nrow = nrow(dat1_test), ncol = TT)
+for(i in 1:nrow(dat1_test)){
+  kramer_S_ln_nb[i,] <- pred_kramer_S_nb(lambda = dat1_test$NBNb[i], sigma = 1/nb_reg$theta, 
+                  mu = dat1_test$LnSe[i], phi = (summary(ln_reg))$dispersion, rho=kramer_rho_ln_nb, TT = TT,ln=T)
+  if (i%%1000==0){print(i)}
+}
+kramertotalloss_ln_nb <- apply(kramer_S_ln_nb, 2, sum)
+da$kramer_ln_nb<-apply(kramer_S_ln_nb,1,mean)
+
+gini(loss="actual",score=c("ind_ln","cond_ln","kramer_ln","our_ln","ind_ln_nb","cond_ln_nb","kramer_ln_nb"),data=da)
+```
+
+```{r}
+pred_S_m <- function(lambda_1, lambda_2, pi_1, pi_2, mu, phi, rho_hat, TT, dis){
+  S <- rep(0, TT) ## aggregated claims amount
+  for(i in 1:TT){
+    I <- rbinom(1, 1, pi_2)
+    if(I == 1){
+      lambda = lambda_2
+    }
+    else{
+      lambda = lambda_1
+    }
+    T_1 = rexp(1, lambda)
+    if(T_1 > 1){
+      S[i] = 0
+    }
+    else{
+      z = mvrnorm(n=1, c(0,0), matrix(c(1, rho_hat, rho_hat, 1), 2, 2))# Generate  $(z_{i,1},z_{i,2})$ from the bivariate normal distribution with correlation $\hat{\rho}$
+      t = inverse_cdf_T(pnorm(z[1]), lambda = lambda)# Recover $T_{n+1}$ by inverting its distribution function
+      N = 1
+      while(t <= 1){
+        N = N + 1
+        t = t + rexp(1, lambda)
+      }
+      # if (t<=1) {N=2}
+      # if (t>1) {N=1}
+      if (dis=="gamma"){
+         alpha = 1/phi # shape parameter of gamma distribution
+         beta = 1/(phi*mu) # rate parameter of gamma distribution
+         S[i] = N*qgamma(pnorm(z[2]), shape = alpha*N, rate = beta*N)
+        }
+      if (dis=="lnorm"){
+          S[i] = N*exp(qnorm(pnorm(z[2]), mean=mu, sd=sqrt(phi) ) )
+      }
+      if (dis=="lgamma"){
+        alpha = 1/phi # shape parameter of gamma distribution
+        beta = 1/(phi*mu) # rate parameter of gamma distribution
+        S[i] = N*exp(qgamma(pnorm(z[2]), shape=alpha, rate=beta ) )
+      }
+      }
+    }
+  return(S)
+}
+```
+
+```{r}
+our_S_ln_m = matrix(nrow = nrow(dat1_test), ncol = TT)
+for(i in 1:nrow(dat1_test)){
+  our_S_ln_m[i,] <- pred_S_m(lambda_1 = dat1_test$MXNb_1[i],
+                             lambda_2 = dat1_test$MXNb_2[i],
+                             pi_1 = mx_reg$prob[1],
+                             pi_2 = mx_reg$prob[2],
+                             mu = dat1_test$LnSe[i], phi = (summary(ln_reg))$dispersion, rho_hat=rho_hat_ln_m, TT = TT, dis="lnorm")
+  if (i%%1000==0){print(i)}
+}
+ourtotalloss_ln_m <- apply(our_S_ln_m, 2, sum)
+da$our_ln_m<-apply(our_S_ln_m,1,mean)
+
+gini(loss="actual",score=c("ind_ln","cond_ln","kramer_ln","our_ln","ind_ln_nb","cond_ln_nb","kramer_ln_nb","our_ln_m"),data=da)
+```
+
+```{r}
+gini(loss="actual",score=c("ind_ln_nb","cond_ln_nb","kramer_ln_nb","our_ln_m"),data=da)
+```
+
+```{r}
+ecdfindependent_ln_nb <- ecdf(independenttotalloss_ln_nb)
+ecdfindependent_ln_nb(actualtotalloss)
+(mean(independenttotalloss_ln_nb)-actualtotalloss)/actualtotalloss
+ind_percent_ln_nb<-agg_per(simulated = independent_S_ln_nb, actual = dat1_test$ClaimAmount)
+
+ecdfcondition_ln_nb <- ecdf(conditiontotalloss_ln_nb)
+ecdfcondition_ln_nb(actualtotalloss)
+(mean(conditiontotalloss_ln_nb)-actualtotalloss)/actualtotalloss
+condi_percent_ln_nb<-agg_per(simulated = condition_S_ln_nb, actual = dat1_test$ClaimAmount)
+
+ecdfkramer_ln_nb <- ecdf(kramertotalloss_ln_nb)
+ecdfkramer_ln_nb(actualtotalloss)
+(mean(kramertotalloss_ln_nb)-actualtotalloss)/actualtotalloss
+kramer_percent_ln_nb<-agg_per(simulated = kramer_S_ln_nb, actual = dat1_test$ClaimAmount)
+
+ecdfour_ln_m <- ecdf(ourtotalloss_ln_m)
+ecdfour_ln_m(actualtotalloss)
+(mean(ourtotalloss_ln_m)-actualtotalloss)/actualtotalloss
+our_percent_ln_m<-agg_per(simulated = our_S_ln_m, actual = dat1_test$ClaimAmount)
+
+ks.test(jitter(ind_percent_ln),"punif")
+ks.test(jitter(condi_percent_ln),"punif")
+ks.test(jitter(kramer_percent_ln),"punif")
+ks.test(jitter(our_percent_ln),"punif")
+ks.test(jitter(ind_percent_ln_nb),"punif")
+ks.test(jitter(condi_percent_ln_nb),"punif")
+ks.test(jitter(kramer_percent_ln_nb),"punif")
+ks.test(jitter(our_percent_ln_m),"punif")
+```
+```{r}
+pred_condition_S_m <- function(lambda_1, lambda_2, pi_1, pi_2,mu, phi, coef_N, TT, dis){
+  S <- rep(0,TT)
+  for(i in 1:TT){
+    I <- rbinom(1, 1, pi_2)
+    if(I == 1){
+      lambda = lambda_2
+    }
+    else{
+      lambda = lambda_1
+    }
+    N <- rpois(1, lambda)
+    if (N == 0){
+      S[i] = 0
+    } 
+    else{
+      if (dis=="gamma"){
+        mu1 = mu * exp(N*coef_N)
+        alpha = 1/phi # shape parameter of gamma distribution
+        beta = 1/(phi*mu1) # rate parameter of gamma distribution
+        S[i] <- N*rgamma(1, shape = N*alpha, rate = N*beta)
+      }
+      if (dis=="lnorm"){
+        mu1 = mu + N*coef_N
+        S[i] <- N*exp(rnorm(1, mean = mu1, sd = sqrt(phi)))
+      }
+      if (dis=="lgamma"){
+        mu1 = mu + N*coef_N
+        alpha = 1/phi
+        beta = 1/(phi*mu1)
+        S[i] <- N*exp(rgamma(1, shape = alpha, rate=beta))
+      }
+    }
+  }
+  return(S)
+}
+```
+
+```{r}
+dmtr <- function(y, lambda_1, lambda_2, pi_1, pi_2){
+  if(y>=1){
+    dp <- (pi_1*dpois(y,lambda_1)+pi_2*dpois(y,lambda_2))/(1-(pi_1*dpois(0,lambda_1)+pi_2*dpois(0,lambda_2)))
+  } else {
+    dp = 0
+  }
+  return(dp)
+}
+
+pmtr <- function(q, lambda_1, lambda_2, pi_1, pi_2){
+  if(q<1){
+    cdf <- 0
+  } else {
+    cdf = 0
+    i = 1 
+    while(i <=floor(q)){
+      cdf <- cdf + dmtr(i,lambda_1, lambda_2, pi_1, pi_2)
+      i <- i+1
+    }
+  }
+  return(cdf)
+}
+```
+
+
+
+```{r}
+ifm_rho_kramer_m <- function(ClaimNb, lambda_1, lambda_2, pi_1, pi_2, Sev, mu, 
+                           phi, ln){
+  
+  alpha = 1/phi # shape parameter of gamma distribution
+  beta = alpha/mu # rate parameter of gamma distribution
+  
+  # calculate u, v, w from Kramer(2013)
+  if (ln==F) {
+    u = pgamma(q = Sev, shape = ClaimNb*alpha, rate = ClaimNb*beta)
+  }
+  if (ln==T){
+    u = pnorm(q = Sev, mean = mu, sd = sqrt(phi) )
+  }
+  v = pmtr(q = ClaimNb, lambda_1, lambda_2, pi_1, pi_2)#pPOtr(q = ClaimNb, mu=lambda)
+  w = pmtr(q = ClaimNb-1,lambda_1, lambda_2, pi_1, pi_2)#pPOtr(q = ClaimNb - 1, mu=lambda)
+  
+  #minus joint log-likelihood
+  object_fun <- function(rho){
+    -sum(log(D1(u, v, rho)-D1(u, w, rho)))
+  }
+  
+  ifm_joint <- optim(par=0,
+                     fn = object_fun,
+                     lower=-1,
+                     upper=1,
+                     method = 'Brent')
+  # rho_hat = (exp(2*ifm_joint$par)-1)/(exp(2*ifm_joint$par)+1)
+  rho_hat = ifm_joint$par
+  return(rho_hat)
+}
+
+(kramer_rho_ln_m <-ifm_rho_kramer_m(
+  ClaimNb = as.numeric(dat2_learn$ClaimNb),
+  lambda_1 = dat2_learn$MXNb_1,
+  lambda_2 = dat2_learn$MXNb_2,
+  pi_1 = mx_reg$prob[1],
+  pi_2 = mx_reg$prob[2],
+  Sev = dat2_learn$LnSev,
+  mu = dat2_learn$LnSe, # mean of gamma distribution
+  phi = (summary(ln_reg))$dispersion, # dispersion parameter of gamma distribution
+  ln=T))
+```
+```{r}
+pred_kramer_S_m <- function(lambda_1, lambda_2, pi_1, pi_2, mu, phi, rho, TT,ln){
+  S <- rep(0,TT)
+  alpha = 1/phi # shape parameter of gamma distribution
+  beta = 1/(phi*mu) # rate parameter of gamma distribution
+  for(i in 1:TT){
+    if (ln==F){
+      sev <- rgamma(1,shape = alpha, rate = beta)
+      u = pgamma(q = sev, shape = alpha, rate = beta)
+    }
+    if (ln==T){
+      sev <- exp(rnorm(1, mean = mu, sd = sqrt(phi)) )
+      u = pnorm(q = log(sev), mean = mu, sd = sqrt(phi) )
+    }
+    Pr_N<-rep(NA,4)
+    Pr_N[0+1] <- pMX(0, mu = list(mu1 = lambda_1, mu2 = lambda_2), 
+                     pi = list(pi1 = pi_1, pi2 = pi_2), family = list(fam1 = "PO", fam2 = "PO"))
+    #ppois(0, lambda)
+    for (k in 1:2){
+      v = pmtr(q=k, lambda_1, lambda_2, pi_1, pi_2)#pPOtr(q = k, mu=lambda)
+      w = pmtr(q=k-1, lambda_1, lambda_2, pi_1, pi_2)#pPOtr(q = k-1, mu=lambda)
+      Pr_N[k+1] <- (D1(u,v,rho)-D1(u,w,rho))*(1-Pr_N[0+1])
+    }
+    Pr_N[4]<-1-sum(Pr_N[1:3])
+    R=which(as.vector(rmultinom(1,1,prob=Pr_N))==1)-1
+    S[i]=R*sev
+    if (is.na(S[i])==1) stop("NA generated") 
+    }
+ return(S)
+}
+```
+
+```{r}
+independent_S_ln_m = matrix(nrow = nrow(dat1_test), ncol = TT)
+for(i in 1:nrow(dat1_test)){
+  independent_S_ln_m[i,] <- pred_condition_S_m(lambda_1 = dat1_test$MXNb_1[i],
+                             lambda_2 = dat1_test$MXNb_2[i],
+                             pi_1 = mx_reg$prob[1],
+                             pi_2 = mx_reg$prob[2], mu = dat1_test$LnSe[i], phi = (summary(ln_reg))$dispersion, coef_N = 0, TT = TT, dis="lnorm")
+    if (i%%1000==0){print(i)}
+}
+independenttotalloss_ln_m <- apply(independent_S_ln_m, 2, sum)
+da$ind_ln_m <-apply(independent_S_ln_m,1,mean)
+
+condition_S_ln_m = matrix(nrow = nrow(dat1_test), ncol = TT)
+for(i in 1:nrow(dat1_test)){
+  condition_S_ln_m[i,] <- pred_condition_S_m(lambda_1 = dat1_test$MXNb_1[i],
+                             lambda_2 = dat1_test$MXNb_2[i],
+                             pi_1 = mx_reg$prob[1],
+                             pi_2 = mx_reg$prob[2], mu = dat1_test$LnSe[i], phi = (summary(ln_reg))$dispersion, coef_N = 0, TT = TT, dis="lnorm")
+  if (i%%1000==0){print(i)}
+}
+conditiontotalloss_ln_m <- apply(condition_S_ln_m, 2, sum)
+da$cond_ln_m <-apply(condition_S_ln_m, 1,mean)
+
+kramer_S_ln_m = matrix(nrow = nrow(dat1_test), ncol = TT)
+for(i in 1:nrow(dat1_test)){
+  kramer_S_ln_m[i,] <- pred_kramer_S_m(lambda_1 = dat1_test$MXNb_1[i],
+                             lambda_2 = dat1_test$MXNb_2[i],
+                             pi_1 = mx_reg$prob[1],
+                             pi_2 = mx_reg$prob[2], mu = dat1_test$LnSe[i],phi = (summary(ln_reg))$dispersion, rho=kramer_rho_ln_m, TT = TT,ln=T)
+  if (i%%1000==0){print(i)}
+}
+kramertotalloss_ln_m <- apply(kramer_S_ln_m, 2, sum)
+da$kramer_ln_m<-apply(kramer_S_ln_m,1,mean)
+```
+
+```{r}
+gini(loss="actual",score=c("ind_ln","cond_ln","kramer_ln","our_ln","ind_ln_nb","cond_ln_nb","kramer_ln_nb","ind_ln_m","cond_ln_m","kramer_ln_m"),data=da)
+```
+```{r}
+claim_frequency <- data.frame(actual=dat1_test$ClaimNb,poi=dat1_test$PoiNb,nb=dat1_test$NBNb,mixpoi=dat1_test$MXNb)
+gini(loss="actual",score=c("poi","nb","mixpoi"),data=claim_frequency)
+```
+```{r}
+ecdfindependent_ln_m <- ecdf(independenttotalloss_ln_m)
+ecdfindependent_ln_m(actualtotalloss)
+(mean(independenttotalloss_ln_m)-actualtotalloss)/actualtotalloss
+ind_percent_ln_m<-agg_per(simulated = independent_S_ln_m, actual = dat1_test$ClaimAmount)
+
+ecdfcondition_ln_m <- ecdf(conditiontotalloss_ln_m)
+ecdfcondition_ln_m(actualtotalloss)
+(mean(conditiontotalloss_ln_m)-actualtotalloss)/actualtotalloss
+condi_percent_ln_m<-agg_per(simulated = condition_S_ln_m, actual = dat1_test$ClaimAmount)
+
+ecdfkramer_ln_m <- ecdf(kramertotalloss_ln_m)
+ecdfkramer_ln_m(actualtotalloss)
+(mean(kramertotalloss_ln_m)-actualtotalloss)/actualtotalloss
+kramer_percent_ln_m<-agg_per(simulated = kramer_S_ln_m, actual = dat1_test$ClaimAmount)
+
+ks.test(jitter(ind_percent_ln),"punif")
+ks.test(jitter(condi_percent_ln),"punif")
+ks.test(jitter(kramer_percent_ln),"punif")
+ks.test(jitter(our_percent_ln),"punif")
+ks.test(jitter(ind_percent_ln_nb),"punif")
+ks.test(jitter(condi_percent_ln_nb),"punif")
+ks.test(jitter(kramer_percent_ln_nb),"punif")
+ks.test(jitter(ind_percent_ln_m),"punif")
+ks.test(jitter(condi_percent_ln_m),"punif")
+ks.test(jitter(kramer_percent_ln_m),"punif")
+ks.test(jitter(our_percent_ln_m),"punif")
+```
+
+
+```{r}
+dm <- function(y, lambda_1, lambda_2, pi_1, pi_2){
+  dp <- (pi_1*dpois(y,lambda_1)+pi_2*dpois(y,lambda_2))/(1-(pi_1*dpois(0,lambda_1)+pi_2*dpois(0,lambda_2)))
+  return(dp)
+}
+numrow = 5
+expnb<-rep(0,numrow)
+for(i in 1:numrow){
+  expnb[i]<-sum(dnbinom(i-1,mu=dat1_test$NBNb,size=summary(nb_reg)$theta)) }
+expp      <- rep(0,numrow)
+for(i in 1:numrow){
+  expp[i] <- sum(dpois((i-1),dat1_test$PoiNb)) }
+expmp      <- rep(0,numrow)
+for(i in 1:numrow){
+  expmp[i] <- sum(dm((i-1),dat1_test$MXNb_1,dat1_test$MXNb_2, mx_reg$prob[1], mx_reg$prob[2])) }
+emp  <-rep(0,numrow)
+for(i in 1:numrow){
+  emp[i]<-sum(dat1_test$ClaimNb==(i-1))
+}
+freqtable <- cbind(emp, expp, expmp, expnb)
+freqtable <- rbind(freqtable, colSums((freqtable - cbind(emp, emp, emp, emp))^2/freqtable))
+```
+
+
+
+
+
+
+```{r}
+gini(loss="actual",score=c("ind_ln","cond_ln","kramer_ln","our_ln","ind_ln_nb","cond_ln_nb","kramer_ln_nb","tweedie"),data=da)
+```
+
+```{r}
+gini(loss='ClaimNb',score=c('PoiNb','NBNb','MXNb'),dat=dat1_test)
 ```
 
 ```{r}
